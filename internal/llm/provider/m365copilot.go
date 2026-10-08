@@ -249,7 +249,7 @@ func (e *m365APIError) Error() string {
 	}
 	if e.Code != "" || e.Message != "" {
 		b.WriteString(": ")
-		b.WriteString(strings.TrimSpace(strings.Trim(e.Code+": "+e.Message, ": ")))
+		b.WriteString(strings.TrimRight(strings.TrimSpace(strings.Trim(e.Code+": "+e.Message, ": ")), "."))
 	}
 	switch e.StatusCode {
 	case http.StatusUnauthorized:
