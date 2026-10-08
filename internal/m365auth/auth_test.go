@@ -30,6 +30,7 @@ type identityServer struct {
 	mu          sync.Mutex
 	forms       []url.Values
 	pendingLeft int
+	dropLeft    int // drop this many device code polls without answering, like a network failure
 	challenge   string
 	refreshErr  string
 }
@@ -48,6 +49,13 @@ func (s *identityServer) handler(w http.ResponseWriter, r *http.Request) {
 	case "/contoso/oauth2/v2.0/token":
 		switch r.PostForm.Get("grant_type") {
 		case "urn:ietf:params:oauth:grant-type:device_code":
+			if s.dropLeft > 0 {
+				s.dropLeft--
+				hj, _ := w.(http.Hijacker)
+				conn, _, _ := hj.Hijack()
+				conn.Close()
+				return
+			}
 			if s.pendingLeft > 0 {
 				s.pendingLeft--
 				w.WriteHeader(http.StatusBadRequest)
@@ -127,6 +135,18 @@ func TestLoginWithDeviceCode(t *testing.T) {
 		if !strings.Contains(scope, want) {
 			t.Errorf("device code request scope %q is missing %s", scope, want)
 		}
+	}
+}
+
+func TestLoginWithDeviceCodeSurvivesNetworkErrors(t *testing.T) {
+	idp, settings := newIdentityServer(t)
+	idp.dropLeft = 1
+	tok, err := LoginWithDeviceCode(context.Background(), http.DefaultClient, settings, func(DeviceCode) {})
+	if err != nil {
+		t.Fatalf("a dropped poll shouldn't end the sign-in: %v", err)
+	}
+	if tok.AccessToken != "access-device" {
+		t.Fatalf("unexpected token %+v", tok)
 	}
 }
 

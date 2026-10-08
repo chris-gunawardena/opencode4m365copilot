@@ -74,6 +74,7 @@ func LoginWithDeviceCode(ctx context.Context, client *http.Client, s Settings, p
 		expiresIn = 900
 	}
 	deadline := time.Now().Add(time.Duration(expiresIn) * time.Second)
+	var lastNetErr error
 	for {
 		select {
 		case <-ctx.Done():
@@ -81,6 +82,9 @@ func LoginWithDeviceCode(ctx context.Context, client *http.Client, s Settings, p
 		case <-time.After(interval):
 		}
 		if time.Now().After(deadline) {
+			if lastNetErr != nil {
+				return nil, fmt.Errorf("the device code expired before sign-in completed (last error: %w)", lastNetErr)
+			}
 			return nil, errors.New("the device code expired before sign-in completed")
 		}
 		tr, err := requestToken(ctx, client, s, url.Values{
@@ -93,13 +97,22 @@ func LoginWithDeviceCode(ctx context.Context, client *http.Client, s Settings, p
 		}
 		var oauthErr *OAuthError
 		if !errors.As(err, &oauthErr) {
-			return nil, err
-		}
-		switch oauthErr.Code {
-		case "authorization_pending":
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			// A network error while polling doesn't end the sign-in; the user may
+			// still be entering the code, so keep polling until it expires.
+			lastNetErr = err
 			continue
-		case "slow_down":
+		}
+		switch {
+		case oauthErr.Code == "authorization_pending":
+			continue
+		case oauthErr.Code == "slow_down":
 			interval += 5 * time.Second
+			continue
+		case oauthErr.StatusCode >= 500:
+			lastNetErr = err
 			continue
 		default:
 			return nil, err

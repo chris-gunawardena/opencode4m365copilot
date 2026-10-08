@@ -223,6 +223,8 @@ func init() {
 	m365StatusCmd.Flags().Bool("test", false, "Send a short test prompt to Microsoft 365 Copilot")
 	for _, c := range []*cobra.Command{m365LoginCmd, m365LogoutCmd, m365StatusCmd} {
 		c.Flags().StringP("cwd", "c", "", "Directory whose .opencode.json to use")
+		// Errors here are about signing in, not about how the command was used.
+		c.SilenceUsage = true
 		m365Cmd.AddCommand(c)
 	}
 	rootCmd.AddCommand(m365Cmd)
