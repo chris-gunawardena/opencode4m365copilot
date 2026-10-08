@@ -46,7 +46,8 @@ var m365LoginCmd = &cobra.Command{
 
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 		defer cancel()
-		ctx, cancelTimeout := context.WithTimeout(ctx, 15*time.Minute)
+		// Longer than a device code lives (15 minutes), so an expired code is reported as such.
+		ctx, cancelTimeout := context.WithTimeout(ctx, 20*time.Minute)
 		defer cancelTimeout()
 
 		client := &http.Client{Timeout: 60 * time.Second}
