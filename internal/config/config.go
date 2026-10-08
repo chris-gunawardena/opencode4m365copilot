@@ -12,6 +12,7 @@ import (
 
 	"github.com/opencode-ai/opencode/internal/llm/models"
 	"github.com/opencode-ai/opencode/internal/logging"
+	"github.com/opencode-ai/opencode/internal/m365auth"
 	"github.com/spf13/viper"
 )
 
@@ -80,6 +81,35 @@ type ShellConfig struct {
 	Args []string `json:"args,omitempty"`
 }
 
+// M365CopilotConfig configures the Microsoft 365 Copilot provider, which uses
+// the Copilot Chat API in Microsoft Graph.
+type M365CopilotConfig struct {
+	// TenantID is the Entra ID tenant to sign in to (GUID or domain). Defaults to "organizations".
+	TenantID string `json:"tenantId,omitempty"`
+	// ClientID is the public client application used to sign in.
+	ClientID string `json:"clientId,omitempty"`
+	// AuthorityHost is the Microsoft identity platform host, for national clouds.
+	AuthorityHost string `json:"authorityHost,omitempty"`
+	// GraphBaseURL is the Copilot API root. Defaults to https://graph.microsoft.com/beta/copilot.
+	GraphBaseURL string `json:"graphBaseUrl,omitempty"`
+	// TimeZone is the IANA time zone sent as the location hint. Defaults to the system time zone.
+	TimeZone string `json:"timeZone,omitempty"`
+	// WebSearch toggles web search grounding. Defaults to true, like the API.
+	WebSearch *bool `json:"webSearch,omitempty"`
+	// MaxMessageChars caps the text of each chat message; longer content such as
+	// tool output is moved into additional context. Defaults to 16000.
+	MaxMessageChars int `json:"maxMessageChars,omitempty"`
+}
+
+// AuthSettings returns the Entra ID settings used to sign in.
+func (m M365CopilotConfig) AuthSettings() m365auth.Settings {
+	return m365auth.Settings{
+		TenantID:      m.TenantID,
+		ClientID:      m.ClientID,
+		AuthorityHost: m.AuthorityHost,
+	}.WithDefaults()
+}
+
 // Config is the main configuration structure for the application.
 type Config struct {
 	Data         Data                              `json:"data"`
@@ -94,6 +124,7 @@ type Config struct {
 	TUI          TUIConfig                         `json:"tui"`
 	Shell        ShellConfig                       `json:"shell,omitempty"`
 	AutoCompact  bool                              `json:"autoCompact,omitempty"`
+	M365Copilot  M365CopilotConfig                 `json:"m365copilot,omitempty"`
 }
 
 // Application constants
@@ -277,6 +308,12 @@ func setProviderDefaults() {
 		// api-key may be empty when using Entra ID credentials – that's okay
 		viper.SetDefault("providers.azure.apiKey", os.Getenv("AZURE_OPENAI_API_KEY"))
 	}
+	if apiKey := m365CopilotAPIKey(); apiKey != "" {
+		viper.SetDefault("providers.m365copilot.apiKey", apiKey)
+		if viper.GetString("providers.m365copilot.apiKey") == "" {
+			viper.Set("providers.m365copilot.apiKey", apiKey)
+		}
+	}
 	if apiKey, err := LoadGitHubToken(); err == nil && apiKey != "" {
 		viper.SetDefault("providers.copilot.apiKey", apiKey)
 		if viper.GetString("providers.copilot.apiKey") == "" {
@@ -285,6 +322,7 @@ func setProviderDefaults() {
 	}
 
 	// Use this order to set the default models
+	// 0. Microsoft 365 Copilot
 	// 1. Copilot
 	// 2. Anthropic
 	// 3. OpenAI
@@ -294,6 +332,15 @@ func setProviderDefaults() {
 	// 7. AWS Bedrock
 	// 8. Azure
 	// 9. Google Cloud VertexAI
+
+	// Microsoft 365 Copilot configuration
+	if key := viper.GetString("providers.m365copilot.apiKey"); strings.TrimSpace(key) != "" {
+		viper.SetDefault("agents.coder.model", models.M365Copilot)
+		viper.SetDefault("agents.summarizer.model", models.M365Copilot)
+		viper.SetDefault("agents.task.model", models.M365Copilot)
+		viper.SetDefault("agents.title.model", models.M365Copilot)
+		return
+	}
 
 	// copilot configuration
 	if key := viper.GetString("providers.copilot.apiKey"); strings.TrimSpace(key) != "" {
@@ -423,6 +470,19 @@ func hasVertexAICredentials() bool {
 		return true
 	}
 	return false
+}
+
+// m365CopilotAPIKey returns the value used as the Microsoft 365 Copilot provider's
+// API key: an access token from the environment, a marker for a cached sign-in,
+// or "" if the user hasn't signed in.
+func m365CopilotAPIKey() string {
+	if token := os.Getenv(m365auth.AccessTokenEnv); token != "" {
+		return token
+	}
+	if m365auth.HasCredentials() {
+		return m365auth.CredentialsSentinel
+	}
+	return ""
 }
 
 func hasCopilotCredentials() bool {
@@ -663,12 +723,26 @@ func getProviderAPIKey(provider models.ModelProvider) string {
 		if hasVertexAICredentials() {
 			return "vertex-ai-credentials-available"
 		}
+	case models.ProviderM365Copilot:
+		return m365CopilotAPIKey()
 	}
 	return ""
 }
 
 // setDefaultModelForAgent sets a default model for an agent based on available providers
 func setDefaultModelForAgent(agent AgentName) bool {
+	if m365CopilotAPIKey() != "" {
+		maxTokens := models.M365CopilotModels[models.M365Copilot].DefaultMaxTokens
+		if agent == AgentTitle {
+			maxTokens = 80
+		}
+
+		cfg.Agents[agent] = Agent{
+			Model:     models.M365Copilot,
+			MaxTokens: maxTokens,
+		}
+		return true
+	}
 	if hasCopilotCredentials() {
 		maxTokens := int64(5000)
 		if agent == AgentTitle {

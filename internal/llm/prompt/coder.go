@@ -18,11 +18,35 @@ func CoderPrompt(provider models.ModelProvider) string {
 	switch provider {
 	case models.ProviderOpenAI:
 		basePrompt = baseOpenAICoderPrompt
+	case models.ProviderM365Copilot:
+		// Microsoft 365 Copilot receives the prompt inside a chat message, so it
+		// gets a shorter prompt and project listing.
+		return fmt.Sprintf("%s\n\n%s\n%s", baseM365CopilotCoderPrompt, getEnvironmentInfoWithLimit(m365ProjectListingLimit), lspInformation())
 	}
 	envInfo := getEnvironmentInfo()
 
 	return fmt.Sprintf("%s\n\n%s\n%s", basePrompt, envInfo, lspInformation())
 }
+
+// m365ProjectListingLimit caps the project listing sent to Microsoft 365 Copilot.
+const m365ProjectListingLimit = 3000
+
+const baseM365CopilotCoderPrompt = `You are OpenCode, an interactive terminal assistant that helps the user with software engineering tasks in the project on their computer: fixing bugs, adding features, refactoring, explaining code and running commands.
+
+# How to work
+- The user's files are only reachable through the local tools described below. Before changing code, read the relevant files with the tools; never guess file contents, paths or command output.
+- Keep going until the task is done: read, edit, then verify (run the build, tests or linter when you know how). Then reply with a short summary.
+- Before editing, check the surrounding code and follow its conventions, libraries and style. Never assume a library is available; check the project's dependency files.
+- Prefer editing existing files to creating new ones. Don't create documentation files unless asked.
+- Use absolute paths in tool arguments.
+- Don't commit changes unless the user asks you to.
+- Explain non-trivial or destructive shell commands before running them.
+
+# Style
+- Be concise and direct; your replies are shown in a terminal and can use GitHub-flavored markdown.
+- Don't add preambles or postambles such as "Here is what I will do". Answer the question, or do the task and summarize it in a few sentences.
+- Don't add code comments unless the code is complex or the user asks.
+- Never print secrets or keys, and never commit them.`
 
 const baseOpenAICoderPrompt = `
 You are operating as and within the OpenCode CLI, a terminal-based agentic coding assistant built by OpenAI. It wraps OpenAI models to enable natural language interaction with a local codebase. You are expected to be precise, safe, and helpful.
@@ -168,6 +192,12 @@ NEVER commit changes unless the user explicitly asks you to. It is VERY IMPORTAN
 You MUST answer concisely with fewer than 4 lines of text (not including tool use or code generation), unless user asks for detail.`
 
 func getEnvironmentInfo() string {
+	return getEnvironmentInfoWithLimit(0)
+}
+
+// getEnvironmentInfoWithLimit describes the environment, cutting the project
+// listing to listingLimit characters if listingLimit is positive.
+func getEnvironmentInfoWithLimit(listingLimit int) string {
 	cwd := config.WorkingDirectory()
 	isGit := isGitRepo(cwd)
 	platform := runtime.GOOS
@@ -176,6 +206,10 @@ func getEnvironmentInfo() string {
 	r, _ := ls.Run(context.Background(), tools.ToolCall{
 		Input: `{"path":"."}`,
 	})
+	listing := r.Content
+	if listingLimit > 0 && len(listing) > listingLimit {
+		listing = listing[:listingLimit] + "\n... (listing truncated; use the ls and glob tools to explore further)"
+	}
 	return fmt.Sprintf(`Here is useful information about the environment you are running in:
 <env>
 Working directory: %s
@@ -186,7 +220,7 @@ Today's date: %s
 <project>
 %s
 </project>
-		`, cwd, boolToYesNo(isGit), platform, date, r.Content)
+		`, cwd, boolToYesNo(isGit), platform, date, listing)
 }
 
 func isGitRepo(dir string) bool {

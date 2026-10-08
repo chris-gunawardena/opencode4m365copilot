@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/opencode-ai/opencode/internal/config"
 	"github.com/opencode-ai/opencode/internal/llm/models"
@@ -200,6 +201,7 @@ func generateSchema() map[string]any {
 		string(models.ProviderBedrock),
 		string(models.ProviderAzure),
 		string(models.ProviderVertexAI),
+		string(models.ProviderM365Copilot),
 	}
 
 	providerSchema["additionalProperties"].(map[string]any)["properties"].(map[string]any)["provider"] = map[string]any{
@@ -209,6 +211,47 @@ func generateSchema() map[string]any {
 	}
 
 	schema["properties"].(map[string]any)["providers"] = providerSchema
+
+	schema["properties"].(map[string]any)["m365copilot"] = map[string]any{
+		"type":        "object",
+		"description": "Microsoft 365 Copilot provider settings (Copilot Chat API in Microsoft Graph)",
+		"properties": map[string]any{
+			"tenantId": map[string]any{
+				"type":        "string",
+				"description": "Entra ID tenant ID or domain to sign in to",
+				"default":     "organizations",
+			},
+			"clientId": map[string]any{
+				"type":        "string",
+				"description": "Application (client) ID of the public client app used to sign in",
+				"default":     "14d82eec-204b-4c2f-b7e8-296a70dab67e",
+			},
+			"authorityHost": map[string]any{
+				"type":        "string",
+				"description": "Microsoft identity platform host, for national clouds",
+				"default":     "https://login.microsoftonline.com",
+			},
+			"graphBaseUrl": map[string]any{
+				"type":        "string",
+				"description": "Copilot API root URL",
+				"default":     "https://graph.microsoft.com/beta/copilot",
+			},
+			"timeZone": map[string]any{
+				"type":        "string",
+				"description": "IANA time zone sent as the location hint (defaults to the system time zone)",
+			},
+			"webSearch": map[string]any{
+				"type":        "boolean",
+				"description": "Allow Copilot to ground answers with web search",
+				"default":     true,
+			},
+			"maxMessageChars": map[string]any{
+				"type":        "integer",
+				"description": "Maximum characters per chat message; longer content is sent as additional context",
+				"default":     16000,
+			},
+		},
+	}
 
 	// Add agents
 	agentSchema := map[string]any{
@@ -242,6 +285,7 @@ func generateSchema() map[string]any {
 	for modelID := range models.SupportedModels {
 		modelEnum = append(modelEnum, string(modelID))
 	}
+	sort.Strings(modelEnum)
 	agentSchema["additionalProperties"].(map[string]any)["properties"].(map[string]any)["model"].(map[string]any)["enum"] = modelEnum
 
 	// Add specific agent properties
