@@ -19,7 +19,7 @@ This fork adds a **Microsoft 365 Copilot** provider to OpenCode. It talks to Cop
 
 ## Requirements
 
-- A **Microsoft 365 Copilot license** assigned to your user, on a work or school account. Personal Microsoft accounts aren't supported by the API.
+- A **Microsoft 365 Copilot license** assigned to your user, on a work or school account. Personal Microsoft accounts aren't supported by the API, and neither is the consumer Copilot app or Copilot Pro: they have no public API.
 - Consent to the delegated Microsoft Graph permissions the Chat API requires. It needs *all* of them:
   `Sites.Read.All`, `Mail.Read`, `People.Read.All`, `OnlineMeetingTranscript.Read.All`, `Chat.Read`, `ChannelMessage.Read.All`, `ExternalItem.Read.All`.
   Several of these need **admin consent**. If sign-in says *"Need admin approval"*, ask a Microsoft 365 / Entra ID administrator to grant consent (see [Using your own app registration](#using-your-own-app-registration)).
@@ -158,6 +158,7 @@ If your organization doesn't allow the default *Microsoft Graph Command Line Too
 | Problem | What to do |
 | ------- | ---------- |
 | `not signed in to Microsoft 365` | Run `opencode m365 login`. |
+| The sign-in page says you need a work or school (business) account, and the login ends with "the device code expired" | You signed in with a personal Microsoft account. The Copilot Chat API only works with a work or school account that has a Microsoft 365 Copilot license. |
 | `Need admin approval` or `AADSTS65001` when signing in | An administrator has to consent to the permissions listed above, or you can [use your own app registration](#using-your-own-app-registration). |
 | `403 Forbidden` from the Copilot API | Check that your user has a Microsoft 365 Copilot license and that `opencode m365 status` shows no missing scopes. |
 | Device code sign-in is blocked by Conditional Access | Use the browser sign-in (`opencode m365 login` without `--device-code`). |
