@@ -112,7 +112,20 @@ func (l *lsTool) Run(ctx context.Context, call ToolCall) (ToolResponse, error) {
 		return ToolResponse{}, fmt.Errorf("error listing directory: %w", err)
 	}
 
-	tree := createFileTree(files)
+	// The tree is printed under searchPath, so build it from relative paths.
+	// With absolute paths every directory above searchPath was printed nested
+	// under it, which led models to request paths such as /a/b/a/b/file.
+	relative := make([]string, 0, len(files))
+	for _, file := range files {
+		rel, err := filepath.Rel(searchPath, file)
+		if err != nil {
+			rel = file
+		} else if strings.HasSuffix(file, string(filepath.Separator)) {
+			rel += string(filepath.Separator)
+		}
+		relative = append(relative, rel)
+	}
+	tree := createFileTree(relative)
 	output := printTree(tree, searchPath)
 
 	if truncated {

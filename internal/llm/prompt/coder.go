@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/opencode-ai/opencode/internal/config"
@@ -18,11 +19,53 @@ func CoderPrompt(provider models.ModelProvider) string {
 	switch provider {
 	case models.ProviderOpenAI:
 		basePrompt = baseOpenAICoderPrompt
+	case models.ProviderM365Copilot:
+		// Microsoft 365 Copilot receives the prompt inside a chat message, so it
+		// gets a shorter prompt and project listing.
+		return fmt.Sprintf("%s\n\n%s\n%s", baseM365CopilotCoderPrompt, m365ProjectInfo(), lspInformation())
 	}
 	envInfo := getEnvironmentInfo()
 
 	return fmt.Sprintf("%s\n\n%s\n%s", basePrompt, envInfo, lspInformation())
 }
+
+// m365ProjectListingLimit caps the project listing sent to Microsoft 365 Copilot.
+const m365ProjectListingLimit = 3000
+
+// m365ProjectInfo describes the project in the user's voice, with a shorter listing.
+func m365ProjectInfo() string {
+	cwd := config.WorkingDirectory()
+	ls := tools.NewLsTool()
+	r, _ := ls.Run(context.Background(), tools.ToolCall{
+		Input: `{"path":"."}`,
+	})
+	listing := r.Content
+	if len(listing) > m365ProjectListingLimit {
+		listing = listing[:m365ProjectListingLimit] + "\n... (listing truncated; use the ls and glob tools to explore further)"
+	}
+	return fmt.Sprintf("# My project\nWorking directory: %s\nGit repository: %s\nPlatform: %s\nToday's date: %s\n\nFiles:\n%s",
+		cwd, boolToYesNo(isGitRepo(cwd)), runtime.GOOS, time.Now().Format("1/2/2006"), strings.TrimSpace(listing))
+}
+
+// baseM365CopilotCoderPrompt is written in the user's voice: Microsoft 365
+// Copilot receives it as part of a chat message, and in live tests it refused
+// to use tools when told "You are OpenCode".
+const baseM365CopilotCoderPrompt = `Please help me with software engineering tasks in my project: fixing bugs, adding features, refactoring, explaining code and running commands.
+
+# How to work
+- Use OpenCode's tools to read the relevant files before changing anything. Don't guess file contents, paths or command output.
+- Keep going until my request is done: read, edit, then verify (run the build, tests or linter when you know how), then give me a short summary.
+- Follow the conventions, libraries and style of the surrounding code. Check the project's dependency files before assuming a library is available.
+- Prefer editing existing files to creating new ones, and don't create documentation files unless I ask.
+- Use absolute paths in tool arguments.
+- Don't commit changes unless I ask you to.
+- Explain non-trivial or destructive shell commands before running them.
+
+# Style
+- Be concise and direct. Your replies are shown in a terminal and can use GitHub-flavored markdown.
+- Skip preambles such as "Here is what I will do": answer, or do the task and summarize it in a few sentences.
+- Don't add code comments unless the code is complex or I ask.
+- Never print or commit secrets or keys.`
 
 const baseOpenAICoderPrompt = `
 You are operating as and within the OpenCode CLI, a terminal-based agentic coding assistant built by OpenAI. It wraps OpenAI models to enable natural language interaction with a local codebase. You are expected to be precise, safe, and helpful.

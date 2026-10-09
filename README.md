@@ -8,6 +8,165 @@ Please follow [Crush][crush] for ongoing development.
 
 [crush]: https://github.com/charmbracelet/crush
 
+# Microsoft 365 Copilot support (this fork)
+
+This fork adds a **Microsoft 365 Copilot** provider to OpenCode. It talks to Copilot through the official [Microsoft 365 Copilot Chat API][chat-api] in Microsoft Graph, so OpenCode can use the Copilot license you already have, signed in with your work account and inside your organization's Microsoft 365 compliance boundary.
+
+> [!IMPORTANT]
+> The Copilot Chat API is a **preview** (`/beta`) API. Microsoft notes that it may change and isn't supported for production use. It has no native tool calling, so this provider emulates tools in text (see [How it works](#how-it-works)). How well that works depends on Copilot following the instructions it's given.
+
+[chat-api]: https://learn.microsoft.com/microsoft-365/copilot/extensibility/api/ai-services/chat/overview
+
+## Requirements
+
+- A **Microsoft 365 Copilot license** assigned to your user, on a work or school account. Personal Microsoft accounts aren't supported by the API, and neither is the consumer Copilot app or Copilot Pro: they have no public API.
+- Consent to the delegated Microsoft Graph permissions the Chat API requires. It needs *all* of them:
+  `Sites.Read.All`, `Mail.Read`, `People.Read.All`, `OnlineMeetingTranscript.Read.All`, `Chat.Read`, `ChannelMessage.Read.All`, `ExternalItem.Read.All`.
+  Several of these need **admin consent**. If sign-in says *"Need admin approval"*, ask a Microsoft 365 / Entra ID administrator to grant consent (see [Using your own app registration](#using-your-own-app-registration)).
+- [Go](https://go.dev/dl/) 1.24 or newer to build OpenCode.
+- Optional: [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) and [fzf](https://github.com/junegunn/fzf) for faster file search.
+
+## Quick start
+
+### 1. Build
+
+The install script, Homebrew and `go install` commands further down install the original OpenCode, not this fork. Build this fork from source:
+
+```bash
+git clone https://github.com/chris-gunawardena/opencode4m365copilot.git
+cd opencode4m365copilot
+go build -o opencode .
+```
+
+This creates an `opencode` binary in the current directory. Move it somewhere on your `PATH` (for example `sudo mv opencode /usr/local/bin/`), or run it as `./opencode`.
+
+### 2. Sign in to Microsoft 365
+
+```bash
+opencode m365 login
+```
+
+This opens your browser to sign in with your work account and approve the permissions above. The tokens are cached in `~/.config/opencode/m365copilot-auth.json`, readable only by you, and refreshed automatically.
+
+If you're on a machine without a browser (for example over SSH), use the device code flow instead and enter the code it prints on any device:
+
+```bash
+opencode m365 login --device-code
+```
+
+To sign in to a specific tenant, add `--tenant contoso.onmicrosoft.com` (or the tenant GUID).
+
+### 3. Check that Copilot answers
+
+```bash
+opencode m365 status --test
+```
+
+This shows the signed-in account and sends a one-line test prompt to Copilot. If it fails with `403 Forbidden`, the account is missing a Copilot license or consent to one of the required permissions.
+
+### 4. Run OpenCode
+
+Go to your project and start the TUI:
+
+```bash
+cd ~/code/my-project
+opencode
+```
+
+Once you're signed in, OpenCode uses **Microsoft 365 Copilot** for every agent by default, unless your config file already sets models for the agents. To switch models at any time, press `Ctrl+O`, use `←`/`→` to get to the *M365copilot* provider and pick **Microsoft 365 Copilot**.
+
+You can also run a single prompt without the TUI. In this mode **all tool permissions are approved automatically**, so only use it on projects where that's safe:
+
+```bash
+opencode -p "Explain what this project does"
+```
+
+To sign out, run `opencode m365 logout`.
+
+## Configuration
+
+All settings are optional. Add an `m365copilot` section to `~/.opencode.json` or to `.opencode.json` in your project:
+
+```json
+{
+  "m365copilot": {
+    "tenantId": "contoso.onmicrosoft.com",
+    "clientId": "00000000-0000-0000-0000-000000000000",
+    "timeZone": "Europe/London",
+    "webSearch": false,
+    "maxMessageChars": 16000
+  },
+  "agents": {
+    "coder": { "model": "m365copilot.chat" },
+    "task": { "model": "m365copilot.chat" },
+    "title": { "model": "m365copilot.chat" },
+    "summarizer": { "model": "m365copilot.chat" }
+  }
+}
+```
+
+| Setting | Default | Description |
+| ------- | ------- | ----------- |
+| `tenantId` | `organizations` | Entra ID tenant to sign in to (domain or GUID). |
+| `clientId` | `14d82eec-204b-4c2f-b7e8-296a70dab67e` | Public client app used to sign in. The default is Microsoft's *Microsoft Graph Command Line Tools* app; set your own if your organization blocks it. |
+| `authorityHost` | `https://login.microsoftonline.com` | Sign-in host, for national clouds. |
+| `graphBaseUrl` | `https://graph.microsoft.com/beta/copilot` | Copilot API root, for national clouds. |
+| `timeZone` | system time zone | IANA time zone sent to Copilot as the required location hint. |
+| `webSearch` | `true` | Set to `false` to stop Copilot from using web search grounding. |
+| `maxMessageChars` | `16000` | Maximum length of each chat message. Larger content, such as long tool output, is sent as additional context instead. Lower it if requests are rejected for being too large. |
+
+The `agents` section is only needed if your config already pins agents to other models. The model ID is `m365copilot.chat`.
+
+Environment variables override the defaults above:
+
+| Variable | Description |
+| -------- | ----------- |
+| `M365_COPILOT_ACCESS_TOKEN` | Use this Microsoft Graph access token instead of signing in, for example one copied from [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer). It isn't refreshed. |
+| `M365_COPILOT_TENANT_ID`, `M365_COPILOT_CLIENT_ID`, `M365_COPILOT_AUTHORITY_HOST` | Sign-in settings when they aren't in the config file. |
+| `M365_COPILOT_GRAPH_URL`, `M365_COPILOT_TIME_ZONE` | API root and time zone when they aren't in the config file. |
+| `M365_COPILOT_TOKEN_CACHE` | Path of the sign-in cache file. |
+
+### Using your own app registration
+
+If your organization doesn't allow the default *Microsoft Graph Command Line Tools* app, register your own:
+
+1. In the [Microsoft Entra admin center](https://entra.microsoft.com), go to **Identity > Applications > App registrations > New registration**. Choose *Accounts in this organizational directory only*.
+2. Under **Authentication**, add the **Mobile and desktop applications** platform with the redirect URI `http://localhost`, and set **Allow public client flows** to **Yes** (needed for `--device-code`).
+3. Under **API permissions**, add these **Microsoft Graph delegated** permissions, then select **Grant admin consent**: `Sites.Read.All`, `Mail.Read`, `People.Read.All`, `OnlineMeetingTranscript.Read.All`, `Chat.Read`, `ChannelMessage.Read.All`, `ExternalItem.Read.All`.
+4. Copy the **Application (client) ID** and **Directory (tenant) ID** into `m365copilot.clientId` and `m365copilot.tenantId`, then run `opencode m365 login` again.
+
+## How it works
+
+- **Conversations.** Each OpenCode session maps to one Copilot conversation (`POST /copilot/conversations`). Replies stream from `chatOverStream` and are shown as they arrive. Title generation uses the synchronous `chat` endpoint.
+- **Instructions.** The Chat API has no system prompt. OpenCode puts a compact version of its instructions, the project's context files and a catalog of its tools in the first message of each conversation, written in your voice ("I'm working on a code project with OpenCode…"). In live tests, Copilot refused to act as "OpenCode", and refused tools that were described as tools or sent as `additionalContext`. Later messages only carry what's new (tool results or your next message) and restate your request, because Copilot loses track of it between turns.
+- **Tools.** The API can't call functions, so Copilot is asked to request an "action" by replying with a fenced code block whose language is `tool_call`, holding JSON such as `{"name": "view", "arguments": {"file_path": "/repo/main.go"}}`. OpenCode runs the tool, after asking your permission as usual, and sends the output back in `<tool_result>` blocks. The parser also accepts `<tool_call>` tags and plain JSON, and repairs common JSON mistakes such as unescaped newlines. If Copilot declines to use the tools at the start of a request, OpenCode asks it once more in the same conversation.
+- **Large content.** Messages are kept under `maxMessageChars`. Long tool output and transcripts go into the request's `additionalContext` instead.
+- **Recovery.** If a conversation can't be continued (it expired, a reply was cancelled, or the history was compacted), OpenCode starts a new conversation and replays the history as a transcript. Throttling (`429`) and gateway errors are retried, honoring `Retry-After`. Expired tokens are refreshed.
+- **Copilot markup.** Copilot's entity tags (such as `<Person>` and `<File>`) and citation markers such as `[^1^]` are removed from replies.
+
+### Limitations
+
+- Every request is answered by Microsoft 365 Copilot with its own grounding in your work data (and in the web, unless `webSearch` is `false`). You can't choose the underlying model, temperature or output length.
+- Tool calling is emulated. In live tests Copilot completed tasks such as fixing a bug and running the tests with the right tool calls, but it occasionally declines to use the tools or replies in a format OpenCode doesn't recognize. If that happens, ask it again to use the tools.
+- The API doesn't report token usage, so the context meter shows an estimate (about 4 characters per token).
+- Images and attachments can't be sent through the API.
+- Long-running requests can hit gateway timeouts, which the API documents as a known limitation.
+- Everything OpenCode sends, including file contents and command output from tool calls, goes to Microsoft 365 Copilot under your account.
+
+### Troubleshooting
+
+| Problem | What to do |
+| ------- | ---------- |
+| `not signed in to Microsoft 365` | Run `opencode m365 login`. |
+| The sign-in page says you need a work or school (business) account, and the login ends with "the device code expired" | You signed in with a personal Microsoft account. The Copilot Chat API only works with a work or school account that has a Microsoft 365 Copilot license. |
+| `Need admin approval` or `AADSTS65001` when signing in | An administrator has to consent to the permissions listed above, or you can [use your own app registration](#using-your-own-app-registration). |
+| `403 Forbidden` from the Copilot API | Check that your user has a Microsoft 365 Copilot license and that `opencode m365 status` shows no missing scopes. |
+| `500 Internal Server Error` with `Got Non-2xx response from IC3. Status = 403 (Forbidden)` | Copilot's backend refused the account. The user needs a base Microsoft 365 plan with Exchange Online and Teams (such as Business Standard or E3) **and** a Microsoft 365 Copilot license, both assigned in the [Microsoft 365 admin center](https://admin.microsoft.com). Newly assigned licenses can take a few hours to take effect. |
+| Device code sign-in is blocked by Conditional Access | Use the browser sign-in (`opencode m365 login` without `--device-code`). |
+| `400 Bad Request` or `413` on long tasks | Lower `m365copilot.maxMessageChars`, for example to `8000`. |
+| Copilot answers but never edits files | Ask it explicitly to use the tools (for example *"use the view tool to read main.go"*). Run `opencode -d` and open the logs (`Ctrl+L`) to see Copilot's raw replies. |
+
+
 
 # ⌬ OpenCode
 
@@ -29,7 +188,7 @@ OpenCode is a Go-based CLI application that brings AI assistance to your termina
 ## Features
 
 - **Interactive TUI**: Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) for a smooth terminal experience
-- **Multiple AI Providers**: Support for OpenAI, Anthropic Claude, Google Gemini, AWS Bedrock, Groq, Azure OpenAI, and OpenRouter
+- **Multiple AI Providers**: Support for Microsoft 365 Copilot, OpenAI, Anthropic Claude, Google Gemini, AWS Bedrock, Groq, Azure OpenAI, and OpenRouter
 - **Session Management**: Save and manage multiple conversation sessions
 - **Tool Integration**: AI can execute commands, search files, and modify code
 - **Vim-like Editor**: Integrated editor with text input capabilities
@@ -206,6 +365,10 @@ This is useful if you want to use a different shell than your default system she
 ## Supported AI Models
 
 OpenCode supports a variety of AI models from different providers:
+
+### Microsoft 365 Copilot
+
+- Microsoft 365 Copilot through the Copilot Chat API (`m365copilot.chat`). See [Microsoft 365 Copilot support](#microsoft-365-copilot-support-this-fork).
 
 ### OpenAI
 

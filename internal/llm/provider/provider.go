@@ -69,6 +69,8 @@ type providerClientOptions struct {
 	geminiOptions    []GeminiOption
 	bedrockOptions   []BedrockOption
 	copilotOptions   []CopilotOption
+
+	m365CopilotOptions []M365CopilotOption
 }
 
 type ProviderClientOption func(*providerClientOptions)
@@ -89,6 +91,11 @@ func NewProvider(providerName models.ModelProvider, opts ...ProviderClientOption
 		o(&clientOptions)
 	}
 	switch providerName {
+	case models.ProviderM365Copilot:
+		return &baseProvider[M365CopilotClient]{
+			options: clientOptions,
+			client:  newM365CopilotClient(clientOptions),
+		}, nil
 	case models.ProviderCopilot:
 		return &baseProvider[CopilotClient]{
 			options: clientOptions,
@@ -243,5 +250,11 @@ func WithBedrockOptions(bedrockOptions ...BedrockOption) ProviderClientOption {
 func WithCopilotOptions(copilotOptions ...CopilotOption) ProviderClientOption {
 	return func(options *providerClientOptions) {
 		options.copilotOptions = copilotOptions
+	}
+}
+
+func WithM365CopilotOptions(m365CopilotOptions ...M365CopilotOption) ProviderClientOption {
+	return func(options *providerClientOptions) {
+		options.m365CopilotOptions = m365CopilotOptions
 	}
 }
