@@ -138,8 +138,8 @@ If your organization doesn't allow the default *Microsoft Graph Command Line Too
 ## How it works
 
 - **Conversations.** Each OpenCode session maps to one Copilot conversation (`POST /copilot/conversations`). Replies stream from `chatOverStream` and are shown as they arrive. Title generation uses the synchronous `chat` endpoint.
-- **Instructions.** The Chat API has no system prompt. OpenCode puts a compact version of its instructions, the project's context files and a catalog of its tools in the first message of each conversation. Later messages only carry what's new: tool results or your next message.
-- **Tools.** The API can't call functions, so Copilot is asked to request a tool by replying with a fenced code block whose language is `tool_call`, holding JSON such as `{"name": "view", "arguments": {"file_path": "/repo/main.go"}}`. OpenCode runs the tool, after asking your permission as usual, and sends the output back in `<tool_result>` blocks. The parser also accepts `<tool_call>` tags and plain JSON, and repairs common JSON mistakes such as unescaped newlines.
+- **Instructions.** The Chat API has no system prompt. OpenCode puts a compact version of its instructions, the project's context files and a catalog of its tools in the first message of each conversation, written in your voice ("I'm working on a code project with OpenCode…"). In live tests, Copilot refused to act as "OpenCode", and refused tools that were described as tools or sent as `additionalContext`. Later messages only carry what's new (tool results or your next message) and restate your request, because Copilot loses track of it between turns.
+- **Tools.** The API can't call functions, so Copilot is asked to request an "action" by replying with a fenced code block whose language is `tool_call`, holding JSON such as `{"name": "view", "arguments": {"file_path": "/repo/main.go"}}`. OpenCode runs the tool, after asking your permission as usual, and sends the output back in `<tool_result>` blocks. The parser also accepts `<tool_call>` tags and plain JSON, and repairs common JSON mistakes such as unescaped newlines. If Copilot declines to use the tools at the start of a request, OpenCode asks it once more in the same conversation.
 - **Large content.** Messages are kept under `maxMessageChars`. Long tool output and transcripts go into the request's `additionalContext` instead.
 - **Recovery.** If a conversation can't be continued (it expired, a reply was cancelled, or the history was compacted), OpenCode starts a new conversation and replays the history as a transcript. Throttling (`429`) and gateway errors are retried, honoring `Retry-After`. Expired tokens are refreshed.
 - **Copilot markup.** Copilot's entity tags (such as `<Person>` and `<File>`) and citation markers such as `[^1^]` are removed from replies.
@@ -147,7 +147,7 @@ If your organization doesn't allow the default *Microsoft Graph Command Line Too
 ### Limitations
 
 - Every request is answered by Microsoft 365 Copilot with its own grounding in your work data (and in the web, unless `webSearch` is `false`). You can't choose the underlying model, temperature or output length.
-- Tool calling is emulated, so Copilot sometimes answers without using a tool, or replies in a format OpenCode doesn't recognize. If that happens, ask it again to use the tools.
+- Tool calling is emulated. In live tests Copilot completed tasks such as fixing a bug and running the tests with the right tool calls, but it occasionally declines to use the tools or replies in a format OpenCode doesn't recognize. If that happens, ask it again to use the tools.
 - The API doesn't report token usage, so the context meter shows an estimate (about 4 characters per token).
 - Images and attachments can't be sent through the API.
 - Long-running requests can hit gateway timeouts, which the API documents as a known limitation.

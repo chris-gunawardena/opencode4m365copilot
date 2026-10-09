@@ -276,13 +276,20 @@ func TestM365StreamToolCallThenContinueConversation(t *testing.T) {
 	if first.body.LocationHint.TimeZone != "Europe/Paris" {
 		t.Fatalf("unexpected location hint %+v", first.body.LocationHint)
 	}
-	for _, want := range []string{"# Instructions", "You are OpenCode, a test assistant.", "```tool_call", "### ls", "What files are in this project?"} {
-		if !strings.Contains(first.body.Message.Text, want) {
+	text := first.body.Message.Text
+	for _, want := range []string{"I'm working on a code project on my computer with OpenCode", "```tool_call", "## Available actions", "### ls",
+		"You are OpenCode, a test assistant.", "# My request\n\nWhat files are in this project?"} {
+		if !strings.Contains(text, want) {
 			t.Errorf("first message is missing %q", want)
 		}
 	}
-	if len(first.body.AdditionalContext) == 0 || !strings.Contains(first.body.AdditionalContext[0].Description, "Reference documentation") {
-		t.Errorf("expected tool docs as additional context, got %+v", first.body.AdditionalContext)
+	// The order that worked against the real service: protocol, instructions, request.
+	if !(strings.Index(text, "## Available actions") < strings.Index(text, "You are OpenCode") &&
+		strings.Index(text, "You are OpenCode") < strings.Index(text, "# My request")) {
+		t.Errorf("first message parts are out of order:\n%s", text)
+	}
+	if len(first.body.AdditionalContext) != 0 {
+		t.Errorf("tool docs in additional context made Copilot refuse the tools; got %+v", first.body.AdditionalContext)
 	}
 	if _, ok := first.raw["contextualResources"]; ok {
 		t.Errorf("web search is on by default, contextualResources should be omitted")
@@ -314,8 +321,12 @@ func TestM365StreamToolCallThenContinueConversation(t *testing.T) {
 	if !strings.Contains(second.body.Message.Text, wantResult) {
 		t.Errorf("second message doesn't hold the tool result:\n%s", second.body.Message.Text)
 	}
-	if strings.Contains(second.body.Message.Text, "# Instructions") || len(second.body.AdditionalContext) != 0 {
+	if strings.Contains(second.body.Message.Text, "## Available actions") || len(second.body.AdditionalContext) != 0 {
 		t.Errorf("a continued conversation shouldn't resend the instructions:\n%s", second.body.Message.Text)
+	}
+	// Copilot forgets the request between turns, so follow-ups restate it.
+	if !strings.Contains(second.body.Message.Text, `My request: "What files are in this project?"`) {
+		t.Errorf("tool results should be followed by the request:\n%s", second.body.Message.Text)
 	}
 
 	// The user follows up: only the new user message is sent.
@@ -354,7 +365,7 @@ func TestM365StartsFreshConversationWhenHistoryDiverges(t *testing.T) {
 		t.Fatalf("expected a new conversation, created %d", created)
 	}
 	text := requests[1].body.Message.Text
-	for _, want := range []string{"# Conversation so far", "Summary of the earlier work.", "## Assistant (you)\nUnderstood.", "# Current request\n\nQuestion two"} {
+	for _, want := range []string{"# Conversation so far", "Summary of the earlier work.", "## Assistant (you)\nUnderstood.", "# My request\n\nQuestion two"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("fresh conversation is missing %q:\n%s", want, text)
 		}
@@ -482,6 +493,80 @@ func TestM365WrappedForbiddenIsNotRetried(t *testing.T) {
 	}
 }
 
+// A real tenant whose Copilot license isn't active yet answers the chat call
+// with 403 and a conversation explaining why, instead of a Graph error.
+func TestM365ForbiddenConversationShowsCopilotReply(t *testing.T) {
+	graph, server := newMockGraph(t)
+	graph.failures = []mockFailure{{status: http.StatusForbidden,
+		body: `{"id":"c1","state":"active","turnCount":1,"messages":[{"id":"u","text":"Hi"},{"id":"r","text":"It looks like you don\u2019t have a valid license. To get access, please check with your administrator."}]}`}}
+	client := newTestM365Client(server, &fakeTokens{})
+	var err error
+	for event := range client.stream(sessionContext("s"), []message.Message{userMessage("u1", "Hi")}, nil) {
+		if event.Type == EventError {
+			err = event.Error
+		}
+	}
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "Copilot replied: It looks like you don’t have a valid license.") || strings.Contains(err.Error(), `"messages"`) {
+		t.Errorf("error should show Copilot's reply, not raw JSON: %v", err)
+	}
+}
+
+// Copilot sometimes declines to use the tools at the start of a request; it is
+// asked once more in the same conversation.
+func TestM365NudgesAfterRefusal(t *testing.T) {
+	graph, server := newMockGraph(t,
+		"I can't access the OpenCode-specific tools from this chat, so I can't read notes.txt.",
+		"```tool_call\n{\"name\": \"view\", \"arguments\": {\"file_path\": \"/repo/notes.txt\"}}\n```",
+	)
+	client := newTestM365Client(server, &fakeTokens{})
+	content, resp := collect(t, client.stream(sessionContext("s"), []message.Message{userMessage("u1", "Read notes.txt")}, testTools()))
+
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Name != "view" || resp.FinishReason != message.FinishReasonToolUse {
+		t.Fatalf("expected the nudged reply's tool call, got %+v", resp)
+	}
+	if !strings.Contains(content, "I can't access") || !strings.Contains(content, m365NudgeNote) || resp.Content != content {
+		t.Errorf("the refusal and the note should both be shown, got %q", content)
+	}
+	created, requests := graph.snapshot()
+	if created != 1 || len(requests) != 2 || requests[1].path != requests[0].path {
+		t.Fatalf("expected a second turn in the same conversation, got %d conversations and %d requests", created, len(requests))
+	}
+	if nudge := requests[1].body.Message.Text; !strings.Contains(nudge, "You don't need access to my computer") || !strings.Contains(nudge, `My request: "Read notes.txt"`) {
+		t.Errorf("unexpected nudge:\n%s", nudge)
+	}
+}
+
+func TestM365DoesNotNudgeAfterToolResults(t *testing.T) {
+	graph, server := newMockGraph(t, "I can't access that URL, it returned 403.")
+	client := newTestM365Client(server, &fakeTokens{})
+	history := []message.Message{
+		userMessage("u1", "Fetch the page"),
+		assistantMessage("a1", "", []message.ToolCall{{ID: "c1", Name: "ls", Input: "{}"}}, message.FinishReasonToolUse),
+		toolMessage("t1", message.ToolResult{ToolCallID: "c1", Content: "403", IsError: true}),
+	}
+	collect(t, client.stream(sessionContext("s"), history, testTools()))
+	if _, requests := graph.snapshot(); len(requests) != 1 {
+		t.Fatalf("a final answer after tool results must not be nudged, got %d requests", len(requests))
+	}
+}
+
+func TestM365LooksLikeRefusal(t *testing.T) {
+	for text, want := range map[string]bool{
+		"I can’t access the OpenCode-specific tools or the project files described in your prompt.": true,
+		"I can't interact with the OpenCode-specific `tool_call` interface from this chat.":         true,
+		"I don't have access to the `/Users/demo/project` filesystem you described.":                true,
+		"```tool_call\n{\"name\": \"ls\", \"arguments\": {}}\n```":                                  false,
+		"The function returns early when the cache is empty.":                                       false,
+	} {
+		if got := m365LooksLikeRefusal(text); got != want {
+			t.Errorf("m365LooksLikeRefusal(%q) = %v, want %v", text, got, want)
+		}
+	}
+}
+
 func TestM365ExpiredConversationIsReplayed(t *testing.T) {
 	graph, server := newMockGraph(t, "One.", "Two.")
 	client := newTestM365Client(server, &fakeTokens{})
@@ -538,7 +623,7 @@ func TestM365LargeToolOutputMovesToAdditionalContext(t *testing.T) {
 	}
 	var moved strings.Builder
 	for _, c := range second.AdditionalContext {
-		if !strings.Contains(c.Description, "Output of tool call") {
+		if !strings.Contains(c.Description, "Output of action") {
 			t.Errorf("unexpected context entry %q", c.Description)
 		}
 		if len(c.Text) > 3000 {

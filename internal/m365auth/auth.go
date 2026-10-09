@@ -158,9 +158,24 @@ func SaveCachedToken(tok *CachedToken) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("failed to write %s: %w", tmp, err)
+	// A unique temporary file, so concurrent opencode processes refreshing the
+	// token can't interleave their writes.
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to write the sign-in cache: %w", err)
+	}
+	tmp := f.Name()
+	_, writeErr := f.Write(data)
+	closeErr := f.Close()
+	if writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr == nil {
+		writeErr = os.Chmod(tmp, 0o600)
+	}
+	if writeErr != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("failed to write %s: %w", tmp, writeErr)
 	}
 	return os.Rename(tmp, path)
 }

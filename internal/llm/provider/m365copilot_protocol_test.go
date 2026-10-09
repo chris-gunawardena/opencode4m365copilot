@@ -249,6 +249,8 @@ func TestM365ToolInstructions(t *testing.T) {
 	text := m365ToolInstructions(testTools())
 	for _, want := range []string{
 		"```tool_call",
+		"I'm working on a code project on my computer with OpenCode",
+		"## Available actions",
 		"### view",
 		"- `file_path` (string, required): The path to the file to read",
 		"- `offset` (integer)",

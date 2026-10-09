@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/opencode-ai/opencode/internal/config"
@@ -21,7 +22,7 @@ func CoderPrompt(provider models.ModelProvider) string {
 	case models.ProviderM365Copilot:
 		// Microsoft 365 Copilot receives the prompt inside a chat message, so it
 		// gets a shorter prompt and project listing.
-		return fmt.Sprintf("%s\n\n%s\n%s", baseM365CopilotCoderPrompt, getEnvironmentInfoWithLimit(m365ProjectListingLimit), lspInformation())
+		return fmt.Sprintf("%s\n\n%s\n%s", baseM365CopilotCoderPrompt, m365ProjectInfo(), lspInformation())
 	}
 	envInfo := getEnvironmentInfo()
 
@@ -31,22 +32,40 @@ func CoderPrompt(provider models.ModelProvider) string {
 // m365ProjectListingLimit caps the project listing sent to Microsoft 365 Copilot.
 const m365ProjectListingLimit = 3000
 
-const baseM365CopilotCoderPrompt = `You are OpenCode, an interactive terminal assistant that helps the user with software engineering tasks in the project on their computer: fixing bugs, adding features, refactoring, explaining code and running commands.
+// m365ProjectInfo describes the project in the user's voice, with a shorter listing.
+func m365ProjectInfo() string {
+	cwd := config.WorkingDirectory()
+	ls := tools.NewLsTool()
+	r, _ := ls.Run(context.Background(), tools.ToolCall{
+		Input: `{"path":"."}`,
+	})
+	listing := r.Content
+	if len(listing) > m365ProjectListingLimit {
+		listing = listing[:m365ProjectListingLimit] + "\n... (listing truncated; use the ls and glob tools to explore further)"
+	}
+	return fmt.Sprintf("# My project\nWorking directory: %s\nGit repository: %s\nPlatform: %s\nToday's date: %s\n\nFiles:\n%s",
+		cwd, boolToYesNo(isGitRepo(cwd)), runtime.GOOS, time.Now().Format("1/2/2006"), strings.TrimSpace(listing))
+}
+
+// baseM365CopilotCoderPrompt is written in the user's voice: Microsoft 365
+// Copilot receives it as part of a chat message, and in live tests it refused
+// to use tools when told "You are OpenCode".
+const baseM365CopilotCoderPrompt = `Please help me with software engineering tasks in my project: fixing bugs, adding features, refactoring, explaining code and running commands.
 
 # How to work
-- The user's files are only reachable through the local tools described below. Before changing code, read the relevant files with the tools; never guess file contents, paths or command output.
-- Keep going until the task is done: read, edit, then verify (run the build, tests or linter when you know how). Then reply with a short summary.
-- Before editing, check the surrounding code and follow its conventions, libraries and style. Never assume a library is available; check the project's dependency files.
-- Prefer editing existing files to creating new ones. Don't create documentation files unless asked.
+- Use OpenCode's tools to read the relevant files before changing anything. Don't guess file contents, paths or command output.
+- Keep going until my request is done: read, edit, then verify (run the build, tests or linter when you know how), then give me a short summary.
+- Follow the conventions, libraries and style of the surrounding code. Check the project's dependency files before assuming a library is available.
+- Prefer editing existing files to creating new ones, and don't create documentation files unless I ask.
 - Use absolute paths in tool arguments.
-- Don't commit changes unless the user asks you to.
+- Don't commit changes unless I ask you to.
 - Explain non-trivial or destructive shell commands before running them.
 
 # Style
-- Be concise and direct; your replies are shown in a terminal and can use GitHub-flavored markdown.
-- Don't add preambles or postambles such as "Here is what I will do". Answer the question, or do the task and summarize it in a few sentences.
-- Don't add code comments unless the code is complex or the user asks.
-- Never print secrets or keys, and never commit them.`
+- Be concise and direct. Your replies are shown in a terminal and can use GitHub-flavored markdown.
+- Skip preambles such as "Here is what I will do": answer, or do the task and summarize it in a few sentences.
+- Don't add code comments unless the code is complex or I ask.
+- Never print or commit secrets or keys.`
 
 const baseOpenAICoderPrompt = `
 You are operating as and within the OpenCode CLI, a terminal-based agentic coding assistant built by OpenAI. It wraps OpenAI models to enable natural language interaction with a local codebase. You are expected to be precise, safe, and helpful.
@@ -192,12 +211,6 @@ NEVER commit changes unless the user explicitly asks you to. It is VERY IMPORTAN
 You MUST answer concisely with fewer than 4 lines of text (not including tool use or code generation), unless user asks for detail.`
 
 func getEnvironmentInfo() string {
-	return getEnvironmentInfoWithLimit(0)
-}
-
-// getEnvironmentInfoWithLimit describes the environment, cutting the project
-// listing to listingLimit characters if listingLimit is positive.
-func getEnvironmentInfoWithLimit(listingLimit int) string {
 	cwd := config.WorkingDirectory()
 	isGit := isGitRepo(cwd)
 	platform := runtime.GOOS
@@ -206,10 +219,6 @@ func getEnvironmentInfoWithLimit(listingLimit int) string {
 	r, _ := ls.Run(context.Background(), tools.ToolCall{
 		Input: `{"path":"."}`,
 	})
-	listing := r.Content
-	if listingLimit > 0 && len(listing) > listingLimit {
-		listing = listing[:listingLimit] + "\n... (listing truncated; use the ls and glob tools to explore further)"
-	}
 	return fmt.Sprintf(`Here is useful information about the environment you are running in:
 <env>
 Working directory: %s
@@ -220,7 +229,7 @@ Today's date: %s
 <project>
 %s
 </project>
-		`, cwd, boolToYesNo(isGit), platform, date, listing)
+		`, cwd, boolToYesNo(isGit), platform, date, r.Content)
 }
 
 func isGitRepo(dir string) bool {

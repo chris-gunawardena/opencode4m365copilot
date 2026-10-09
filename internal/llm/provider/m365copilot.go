@@ -289,7 +289,8 @@ func (e *m365APIError) Error() string {
 	case http.StatusUnauthorized:
 		b.WriteString(". Sign in again with `opencode m365 login`.")
 	case http.StatusForbidden:
-		b.WriteString(". The Chat API needs a Microsoft 365 Copilot license and consent to its Graph permissions " +
+		b.WriteString(". The Chat API needs a Microsoft 365 Copilot license on top of an eligible Microsoft 365 plan " +
+			"(e.g. Business Basic, Standard or Premium, or E3/E5), and consent to its Graph permissions " +
 			"(Sites.Read.All, Mail.Read, People.Read.All, OnlineMeetingTranscript.Read.All, Chat.Read, " +
 			"ChannelMessage.Read.All, ExternalItem.Read.All); some of them need an administrator to consent.")
 	case http.StatusRequestEntityTooLarge:
@@ -314,7 +315,10 @@ type m365Turn struct {
 	sessionID      string
 	conversationID string // empty: create a conversation first
 	reused         bool   // continues an existing conversation
-	request        m365ChatRequest
+	// newRequest is set when the input is a new user message, where Copilot
+	// sometimes declines to use the actions and gets one nudge.
+	newRequest bool
+	request    m365ChatRequest
 	// synced is the list of message IDs the conversation holds once this turn succeeds.
 	// nil means the conversation can't be continued later.
 	synced []string
@@ -375,6 +379,7 @@ func (c *m365CopilotClient) planTurn(ctx context.Context, messages []message.Mes
 	}
 
 	toolNames := m365ToolCallNames(messages)
+	request := m365LastUserText(messages)
 	if allowReuse && turn.synced != nil {
 		c.mu.Lock()
 		state := c.conversations[sessionID]
@@ -383,13 +388,15 @@ func (c *m365CopilotClient) planTurn(ctx context.Context, messages []message.Mes
 			if rest, ok := state.continuation(messages); ok {
 				turn.conversationID = state.id
 				turn.reused = true
-				turn.request = c.buildContinuationRequest(rest, tools, toolNames)
+				turn.request = c.buildContinuationRequest(rest, tools, toolNames, request)
+				turn.newRequest = rest[len(rest)-1].Role == message.User
 				turn.contextChars = c.estimateContextChars(messages, tools)
 				return turn
 			}
 		}
 	}
-	turn.request = c.buildFreshRequest(messages, tools, toolNames)
+	turn.request = c.buildFreshRequest(messages, tools, toolNames, request)
+	turn.newRequest = len(messages) > 0 && messages[len(messages)-1].Role == message.User
 	turn.contextChars = c.estimateContextChars(messages, tools)
 	return turn
 }
@@ -520,10 +527,10 @@ func m365Chunk(text, description string, max int) []m365ContextMessage {
 	return out
 }
 
-// buildFreshRequest starts a new Copilot conversation: it sends the
-// instructions, the tool catalog, a transcript of any earlier messages and the
-// latest input.
-func (c *m365CopilotClient) buildFreshRequest(messages []message.Message, tools []toolsPkg.BaseTool, toolNames map[string]string) m365ChatRequest {
+// buildFreshRequest starts a new Copilot conversation. In the order that
+// worked in live tests: how to request actions and the action catalog, the
+// agent's instructions, a transcript of any earlier messages, then the request.
+func (c *m365CopilotClient) buildFreshRequest(messages []message.Message, tools []toolsPkg.BaseTool, toolNames map[string]string, request string) m365ChatRequest {
 	max := c.options.maxMessageChars
 	// The latest input is everything after the last assistant message.
 	split := len(messages)
@@ -537,17 +544,17 @@ func (c *m365CopilotClient) buildFreshRequest(messages []message.Message, tools 
 	}
 
 	var parts []m365Part
-	if system := strings.TrimSpace(c.providerOptions.systemMessage); system != "" {
-		parts = append(parts, m365Part{text: "# Instructions\n\n" + system})
-	}
 	if len(tools) > 0 {
 		parts = append(parts, m365Part{
 			text:        m365ToolInstructions(tools),
 			moveRank:    3,
-			description: "Local tool catalog",
-			placeholder: fmt.Sprintf(m365ToolProtocol, m365ExampleToolCall(tools)) +
-				"\n\nThe tools and their arguments are listed in the additional context \"Local tool catalog\".",
+			description: "OpenCode actions",
+			placeholder: fmt.Sprintf(m365ToolProtocol, m365ToolFence, m365ExampleToolCall(tools)) +
+				"\n\nThe available actions and their arguments are listed in the additional context \"OpenCode actions\".",
 		})
+	}
+	if system := strings.TrimSpace(c.providerOptions.systemMessage); system != "" {
+		parts = append(parts, m365Part{text: system})
 	}
 	if len(earlier) > 0 {
 		transcript := m365Transcript(earlier, toolNames, max*4)
@@ -558,30 +565,24 @@ func (c *m365CopilotClient) buildFreshRequest(messages []message.Message, tools 
 			placeholder: "# Conversation so far\n\nThe earlier conversation is attached as additional context \"Transcript of the earlier conversation\".",
 		})
 	}
-	if len(current) == 0 {
-		parts = append(parts, m365Part{text: "# Current request\n\nContinue with the task."})
-	} else {
-		parts = append(parts, m365Part{text: "# Current request"})
-		parts = append(parts, c.inputParts(current, toolNames)...)
+	switch {
+	case len(current) == 0 && len(tools) > 0:
+		parts = append(parts, m365Part{text: m365FollowUpText(request, tools)})
+	case len(current) == 0:
+		parts = append(parts, m365Part{text: "Please continue."})
+	case current[0].Role == message.User:
+		parts = append(parts, m365Part{text: "# My request"})
+		parts = append(parts, c.inputParts(current, tools, toolNames, request, false)...)
+	default:
+		parts = append(parts, c.inputParts(current, tools, toolNames, request, false)...)
 	}
-	if len(tools) > 0 {
-		parts = append(parts, m365Part{text: fmt.Sprintf(m365ToolReminder, m365ToolNames(tools))})
-	}
-
-	var extra []m365ContextMessage
-	if len(tools) > 0 {
-		extra = m365Chunk(m365ToolDocs(tools), "Reference documentation for OpenCode's local tools", max)
-	}
-	text, context := m365Assemble(parts, max, extra)
+	text, context := m365Assemble(parts, max, nil)
 	return c.newRequest(text, context)
 }
 
 // buildContinuationRequest sends only the new messages to an existing conversation.
-func (c *m365CopilotClient) buildContinuationRequest(newMessages []message.Message, tools []toolsPkg.BaseTool, toolNames map[string]string) m365ChatRequest {
-	parts := c.inputParts(newMessages, toolNames)
-	if len(tools) > 0 {
-		parts = append(parts, m365Part{text: fmt.Sprintf(m365ToolReminder, m365ToolNames(tools))})
-	}
+func (c *m365CopilotClient) buildContinuationRequest(newMessages []message.Message, tools []toolsPkg.BaseTool, toolNames map[string]string, request string) m365ChatRequest {
+	parts := c.inputParts(newMessages, tools, toolNames, request, true)
 	text, context := m365Assemble(parts, c.options.maxMessageChars, nil)
 	return c.newRequest(text, context)
 }
@@ -599,29 +600,35 @@ func (c *m365CopilotClient) newRequest(text string, context []m365ContextMessage
 	return req
 }
 
-// inputParts renders user messages and tool results that Copilot hasn't seen yet.
-func (c *m365CopilotClient) inputParts(messages []message.Message, toolNames map[string]string) []m365Part {
+// inputParts renders user messages and tool results that Copilot hasn't seen
+// yet. Tool results are followed by the request and the action format, and so
+// are user messages if reminder is set.
+func (c *m365CopilotClient) inputParts(messages []message.Message, tools []toolsPkg.BaseTool, toolNames map[string]string, request string, reminder bool) []m365Part {
 	max := c.options.maxMessageChars
 	var parts []m365Part
-	for _, msg := range messages {
+	for i, msg := range messages {
+		last := i == len(messages)-1
 		switch msg.Role {
 		case message.User:
 			text := strings.TrimSpace(msg.Content().String())
 			if n := len(msg.BinaryContent()) + len(msg.ImageURLContent()); n > 0 {
-				text += fmt.Sprintf("\n\n(The user attached %d image(s), which Microsoft 365 Copilot can't receive through this API.)", n)
+				text += fmt.Sprintf("\n\n(I attached %d image(s), which can't be sent to you through this API.)", n)
 			}
 			parts = append(parts, m365Part{
 				text:        text,
 				moveRank:    4,
-				description: "The user's message",
-				placeholder: "The user's message is attached as additional context \"The user's message\".",
+				description: "My message",
+				placeholder: "My message is attached as additional context \"My message\".",
 			})
+			if reminder && last && len(tools) > 0 {
+				parts = append(parts, m365Part{text: m365ReminderText(tools)})
+			}
 		case message.Tool:
 			results := msg.ToolResults()
 			if len(results) == 0 {
 				continue
 			}
-			parts = append(parts, m365Part{text: "OpenCode ran the tools you requested. Results:"})
+			parts = append(parts, m365Part{text: m365ResultsIntro})
 			for _, result := range results {
 				name := toolNames[result.ToolCallID]
 				if name == "" {
@@ -632,7 +639,7 @@ func (c *m365CopilotClient) inputParts(messages []message.Message, toolNames map
 				if strings.TrimSpace(content) == "" {
 					content = "(no output)"
 				}
-				description := fmt.Sprintf("Output of tool call %s (%s)", result.ToolCallID, name)
+				description := fmt.Sprintf("Output of action %s (%s)", result.ToolCallID, name)
 				parts = append(parts, m365Part{
 					text:        header + "\n" + content + "\n</tool_result>",
 					moveRank:    2,
@@ -640,12 +647,28 @@ func (c *m365CopilotClient) inputParts(messages []message.Message, toolNames map
 					placeholder: fmt.Sprintf("%s\n(The output is attached as additional context %q.)\n</tool_result>", header, description),
 				})
 			}
-			parts = append(parts, m365Part{text: "Continue with the task: call more tools if you need to, otherwise reply with your answer."})
+			if last && len(tools) > 0 {
+				parts = append(parts, m365Part{text: m365FollowUpText(request, tools)})
+			} else if last {
+				parts = append(parts, m365Part{text: "Please continue."})
+			}
 		case message.Assistant:
 			// Only reached for fresh conversations through the transcript.
 		}
 	}
 	return parts
+}
+
+// m365LastUserText returns the text of the most recent user message.
+func m365LastUserText(messages []message.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == message.User {
+			if text := strings.TrimSpace(messages[i].Content().String()); text != "" {
+				return text
+			}
+		}
+	}
+	return "continue with the task"
 }
 
 // m365Transcript renders earlier messages as text, keeping the most recent
@@ -707,8 +730,35 @@ func m365EstimateTokens(chars int) int64 {
 // Running a turn
 
 type m365TurnResult struct {
-	text         string
-	attributions []m365Attribution
+	text           string
+	attributions   []m365Attribution
+	conversationID string
+	newRequest     bool
+}
+
+// m365NudgeNote is shown when Copilot declined to use the actions and is asked again.
+const m365NudgeNote = "_(Copilot declined to use OpenCode's tools; asking it again.)_"
+
+// shouldNudge reports whether Copilot declined to use the actions at the start of a request.
+func (c *m365CopilotClient) shouldNudge(result *m365TurnResult, tools []toolsPkg.BaseTool) bool {
+	return len(tools) > 0 && result.newRequest && result.conversationID != "" &&
+		len(m365ParseToolCalls(result.text, tools)) == 0 && m365LooksLikeRefusal(result.text)
+}
+
+// nudge asks Copilot once more, in the same conversation, to use the actions.
+func (c *m365CopilotClient) nudge(ctx context.Context, result *m365TurnResult, messages []message.Message, tools []toolsPkg.BaseTool, streaming bool, onText func(string)) (*m365TurnResult, error) {
+	logging.Info("Microsoft 365 Copilot declined to use OpenCode's tools, asking again", "reply", m365TruncateMiddle(result.text, 300))
+	turn := m365Turn{
+		conversationID: result.conversationID,
+		request:        c.newRequest(m365Nudge+"\n\n"+m365FollowUpText(m365LastUserText(messages), tools), nil),
+	}
+	nudged, err := c.execute(ctx, &turn, streaming, onText)
+	if err != nil {
+		return nil, err
+	}
+	nudged.conversationID = result.conversationID
+	c.debugResponse(ctx, messages, nudged)
+	return nudged, nil
 }
 
 func (c *m365CopilotClient) send(ctx context.Context, messages []message.Message, tools []toolsPkg.BaseTool) (*ProviderResponse, error) {
@@ -716,7 +766,16 @@ func (c *m365CopilotClient) send(ctx context.Context, messages []message.Message
 	if err != nil {
 		return nil, err
 	}
-	return c.response(result, m365VisibleText(result.text, true), messages, tools), nil
+	content := m365VisibleText(result.text, true)
+	if c.shouldNudge(result, tools) {
+		if nudged, err := c.nudge(ctx, result, messages, tools, false, nil); err == nil {
+			content = strings.TrimSpace(content + "\n\n" + m365NudgeNote + "\n\n" + m365VisibleText(nudged.text, true))
+			result = nudged
+		} else {
+			logging.Warn("Microsoft 365 Copilot nudge failed", "error", err)
+		}
+	}
+	return c.response(result, content, messages, tools), nil
 }
 
 func (c *m365CopilotClient) stream(ctx context.Context, messages []message.Message, tools []toolsPkg.BaseTool) <-chan ProviderEvent {
@@ -754,6 +813,25 @@ func (c *m365CopilotClient) stream(ctx context.Context, messages []message.Messa
 			logging.Debug("Microsoft 365 Copilot rewrote streamed text; keeping what was shown")
 		}
 		showUpTo(final)
+		if c.shouldNudge(result, tools) {
+			note := strings.TrimSpace(emitted + "\n\n" + m365NudgeNote)
+			withNote := func(text string) string {
+				if text == "" {
+					return note
+				}
+				return note + "\n\n" + text
+			}
+			showUpTo(note)
+			nudged, err := c.nudge(ctx, result, messages, tools, true, func(full string) {
+				showUpTo(withNote(m365VisibleText(full, false)))
+			})
+			if err == nil {
+				showUpTo(withNote(m365VisibleText(nudged.text, true)))
+				result = nudged
+			} else {
+				logging.Warn("Microsoft 365 Copilot nudge failed", "error", err)
+			}
+		}
 		emit(ProviderEvent{Type: EventComplete, Response: c.response(result, emitted, messages, tools)})
 	}()
 	return events
@@ -790,6 +868,8 @@ func (c *m365CopilotClient) converse(ctx context.Context, messages []message.Mes
 		if err == nil {
 			c.remember(turn)
 			c.debugResponse(ctx, messages, result)
+			result.conversationID = turn.conversationID
+			result.newRequest = turn.newRequest
 			return result, nil
 		}
 		c.forget(turn.sessionID)
@@ -957,8 +1037,13 @@ func (c *m365CopilotClient) do(ctx context.Context, operation, path string, body
 	var graphErr struct {
 		Error m365GraphError `json:"error"`
 	}
+	var conv m365ConversationResponse
 	if json.Unmarshal(data, &graphErr) == nil && (graphErr.Error.Code != "" || graphErr.Error.Message != "") {
 		apiErr.Code, apiErr.Message = graphErr.Error.Code, graphErr.Error.Message
+	} else if json.Unmarshal(data, &conv) == nil && len(conv.Messages) > 0 {
+		// Copilot can refuse a turn with a conversation whose last message
+		// explains why, e.g. a 403 when the user's license isn't valid.
+		apiErr.Message = "Copilot replied: " + strings.TrimSpace(conv.Messages[len(conv.Messages)-1].Text)
 	} else {
 		apiErr.Message = strings.TrimSpace(string(data))
 	}

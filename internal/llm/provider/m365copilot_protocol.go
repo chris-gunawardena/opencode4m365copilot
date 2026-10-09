@@ -21,29 +21,72 @@ import (
 	"github.com/opencode-ai/opencode/internal/message"
 )
 
+// m365ToolFence is the language of the fenced block Copilot writes to call a tool.
 const m365ToolFence = "tool_call"
 
-// m365ToolProtocol explains the tool protocol. It goes in the chat message
-// itself rather than in additionalContext, because Copilot treats additional
-// context as grounding data rather than as instructions.
-const m365ToolProtocol = "You are connected to the user's computer through OpenCode, a terminal coding assistant. " +
-	"OpenCode can run the local tools listed below on the user's behalf and send you their output. " +
-	"You can't read the user's files or run commands yourself, so request a tool instead of guessing, " +
-	"and don't search the web or Microsoft 365 for information about the local project.\n\n" +
-	"To call a tool, reply with a fenced code block whose language is `tool_call`, containing one JSON object " +
-	"with the tool `name` and its `arguments`, exactly like this:\n\n" +
-	"```tool_call\n%s\n```\n\n" +
-	"Rules:\n" +
-	"- `arguments` must be valid JSON that matches the tool's parameters. Escape newlines and quotes inside strings.\n" +
-	"- You can call several independent tools at once by writing one ```tool_call block per call.\n" +
-	"- Put the tool_call blocks at the end of your reply and stop. OpenCode runs them and replies with " +
-	"<tool_result> blocks; never write tool results yourself.\n" +
-	"- When the task is done, or you need the user's input, reply normally without any tool_call block."
+// The wording below comes from live tests against Microsoft 365 Copilot. It
+// refused to act as "OpenCode" and refused "tools" it compared with its own
+// built-in ones ("I can't use the OpenCode-specific tools in this chat"), and
+// it treated tool documentation sent as additional context the same way.
+// Describing the tools as actions that OpenCode carries out, in the user's
+// voice and inside the chat message, made it use them reliably.
 
-// m365ToolReminder is repeated on every turn of a conversation so the protocol
-// survives Copilot trimming older turns from its own context.
-const m365ToolReminder = "(Reminder: to use a tool, reply with ```tool_call blocks containing " +
-	"{\"name\": ..., \"arguments\": {...}}. Available tools: %s.)"
+// m365ToolProtocol explains how to request an action. Format with the fence and an example call.
+const m365ToolProtocol = "I'm working on a code project on my computer with OpenCode, a terminal app that can read files, " +
+	"write files and run commands in my project for me. You can't see the project yourself, so whenever you need to " +
+	"look at a file, change a file or run a command, write an action block and OpenCode will carry it out automatically " +
+	"and paste the output into my next message.\n\n" +
+	"Action block format (one per action; the JSON must be valid):\n\n" +
+	"```%s\n%s\n```\n\n" +
+	"Put action blocks at the end of your reply. Never ask me to paste files or run commands; use an action block. " +
+	"When everything I asked for is done, reply without an action block."
+
+// m365FollowUp restates the request and the action format on later turns: in
+// live tests Copilot lost track of a request made in an earlier message.
+// Format with the request, the fence and the action names.
+const m365FollowUp = "My request: \"%s\"\nIf anything is left to do, write the next action block(s) now " +
+	"(```%s with {\"name\": ..., \"arguments\": {...}}; actions: %s). I can't run anything myself. " +
+	"When everything is done, reply without an action block."
+
+// m365Reminder follows a new user message in an existing conversation. Format
+// with the fence and the action names.
+const m365Reminder = "(To work on my project, write action blocks: ```%s with {\"name\": ..., \"arguments\": {...}}; " +
+	"actions: %s. I can't run anything myself.)"
+
+// m365Nudge is sent once when Copilot declines to use the actions at the start of a request.
+const m365Nudge = "You don't need access to my computer: OpenCode carries out the action blocks you write and sends you the output."
+
+// m365ResultsIntro opens a message with tool output.
+const m365ResultsIntro = "OpenCode carried out your actions:"
+
+var m365Refusal = regexp.MustCompile(`(?i)\b(?:can['’]?t|cannot|unable to|not able to|don['’]?t have|do not have)\b[^.\n]{0,80}\b(?:access|use|interact|invoke|run|read|open|call)`)
+
+// m365LooksLikeRefusal reports whether a reply declines to use the actions,
+// e.g. "I can't access the OpenCode-specific tools from this chat".
+func m365LooksLikeRefusal(reply string) bool {
+	head := reply
+	if len(head) > 400 {
+		head = head[:400]
+	}
+	return m365Refusal.MatchString(head)
+}
+
+func m365FollowUpText(request string, ts []tools.BaseTool) string {
+	return fmt.Sprintf(m365FollowUp, m365Quote(request), m365ToolFence, m365ToolNames(ts))
+}
+
+func m365ReminderText(ts []tools.BaseTool) string {
+	return fmt.Sprintf(m365Reminder, m365ToolFence, m365ToolNames(ts))
+}
+
+// m365Quote shortens a request to quote it back to Copilot.
+func m365Quote(request string) string {
+	request = strings.Join(strings.Fields(request), " ")
+	if len(request) > 600 {
+		request = strings.ToValidUTF8(request[:600], "") + "…"
+	}
+	return strings.ReplaceAll(request, `"`, `'`)
+}
 
 // newM365ToolCallID returns an ID for an emulated tool call.
 func newM365ToolCallID() string {
@@ -68,8 +111,8 @@ func m365ToolInstructions(ts []tools.BaseTool) string {
 		return ""
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, m365ToolProtocol, m365ExampleToolCall(ts))
-	b.WriteString("\n\n## Available tools\n")
+	fmt.Fprintf(&b, m365ToolProtocol, m365ToolFence, m365ExampleToolCall(ts))
+	b.WriteString("\n\n## Available actions\n")
 	for _, t := range ts {
 		info := t.Info()
 		fmt.Fprintf(&b, "\n### %s\n%s\n", info.Name, m365Summary(info.Description, 400))
@@ -82,17 +125,6 @@ func m365ToolInstructions(ts []tools.BaseTool) string {
 		}
 	}
 	return b.String()
-}
-
-// m365ToolDocs holds the full tool descriptions. They are sent once per
-// conversation as additional context, where they serve as reference material.
-func m365ToolDocs(ts []tools.BaseTool) string {
-	var b strings.Builder
-	for _, t := range ts {
-		info := t.Info()
-		fmt.Fprintf(&b, "## Tool `%s`\n%s\n\n", info.Name, strings.TrimSpace(info.Description))
-	}
-	return strings.TrimSpace(b.String())
 }
 
 func m365ExampleToolCall(ts []tools.BaseTool) string {
@@ -328,7 +360,7 @@ func m365FindToolFence(s string, pos int) (start, bodyStart int) {
 func m365IsToolFenceInfo(info string) bool {
 	info = strings.ToLower(strings.TrimSpace(info))
 	info = strings.NewReplacer("_", "", "-", "", " ", "").Replace(info)
-	return info == "toolcall" || info == "tooluse"
+	return info == "toolcall" || info == "tooluse" || info == "action"
 }
 
 // m365FindFenceClose finds the closing ``` line of a fenced block whose body starts at bodyStart.
