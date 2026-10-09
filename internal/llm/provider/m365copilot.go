@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,7 +47,14 @@ const (
 	m365MaxContextEntries = 24
 	// m365IntermediateUpdate is the displayName of streamed partial snapshots.
 	m365IntermediateUpdate = "Intermediate Conversation Update"
+	// m365MaxServerErrorRetries bounds retries of 5xx errors, which are less
+	// often transient than throttling.
+	m365MaxServerErrorRetries = 3
 )
+
+// m365UpstreamStatus finds the status code of a backend failure that Graph
+// wraps in a 500, e.g. "Got Non-2xx response from IC3. Status = 403 (Forbidden)".
+var m365UpstreamStatus = regexp.MustCompile(`Status\s*=\s*(\d{3})`)
 
 type m365CopilotOptions struct {
 	baseURL         string
@@ -239,6 +247,28 @@ type m365APIError struct {
 	Message    string
 	RetryAfter time.Duration
 	Operation  string
+	RequestID  string
+}
+
+// upstreamStatus returns the backend status code wrapped in a Graph 5xx error, or 0.
+func (e *m365APIError) upstreamStatus() int {
+	if e.StatusCode < 500 {
+		return 0
+	}
+	if m := m365UpstreamStatus.FindStringSubmatch(e.Message); m != nil {
+		code, _ := strconv.Atoi(m[1])
+		return code
+	}
+	return 0
+}
+
+// retryable reports whether the request may succeed if sent again.
+func (e *m365APIError) retryable() bool {
+	if e.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	upstream := e.upstreamStatus()
+	return e.StatusCode >= 500 && (upstream == 0 || upstream >= 500 || upstream == http.StatusTooManyRequests)
 }
 
 func (e *m365APIError) Error() string {
@@ -251,7 +281,11 @@ func (e *m365APIError) Error() string {
 		b.WriteString(": ")
 		b.WriteString(strings.TrimRight(strings.TrimSpace(strings.Trim(e.Code+": "+e.Message, ": ")), "."))
 	}
-	switch e.StatusCode {
+	status := e.StatusCode
+	if upstream := e.upstreamStatus(); upstream == http.StatusForbidden || upstream == http.StatusUnauthorized {
+		status = upstream
+	}
+	switch status {
 	case http.StatusUnauthorized:
 		b.WriteString(". Sign in again with `opencode m365 login`.")
 	case http.StatusForbidden:
@@ -260,6 +294,14 @@ func (e *m365APIError) Error() string {
 			"ChannelMessage.Read.All, ExternalItem.Read.All); some of them need an administrator to consent.")
 	case http.StatusRequestEntityTooLarge:
 		b.WriteString(". Try a lower m365copilot.maxMessageChars.")
+	}
+	if e.upstreamStatus() == http.StatusForbidden {
+		b.WriteString(" Copilot's backend refused this account: check that the user has a Microsoft 365 plan " +
+			"(e.g. Business Standard or E3, with Exchange Online and Teams) and a Microsoft 365 Copilot license assigned. " +
+			"New licenses can take a few hours to take effect.")
+	}
+	if e.RequestID != "" {
+		fmt.Fprintf(&b, " (request-id %s)", e.RequestID)
 	}
 	return b.String()
 }
@@ -769,8 +811,12 @@ func (c *m365CopilotClient) converse(ctx context.Context, messages []message.Mes
 			// The conversation expired or reached its limit: replay the history into a new one.
 			logging.Info("Microsoft 365 Copilot conversation can't be continued, starting a new one", "error", err)
 			turn = c.planTurn(ctx, messages, tools, false)
-		case apiErr.StatusCode == http.StatusTooManyRequests || apiErr.StatusCode >= 500:
-			if attempt > maxRetries {
+		case apiErr.retryable():
+			limit := maxRetries
+			if apiErr.StatusCode >= 500 {
+				limit = m365MaxServerErrorRetries
+			}
+			if attempt > limit {
 				return nil, err
 			}
 			wait = apiErr.RetryAfter
@@ -780,7 +826,7 @@ func (c *m365CopilotClient) converse(ctx context.Context, messages []message.Mes
 			if wait > 60*time.Second {
 				wait = 60 * time.Second
 			}
-			logging.WarnPersist(fmt.Sprintf("Microsoft 365 Copilot is busy (%s), retrying... attempt %d of %d", apiErr.Status, attempt, maxRetries),
+			logging.WarnPersist(fmt.Sprintf("Microsoft 365 Copilot is busy (%s), retrying... attempt %d of %d", apiErr.Status, attempt, limit),
 				logging.PersistTimeArg, wait+100*time.Millisecond)
 		default:
 			return nil, err
@@ -907,7 +953,7 @@ func (c *m365CopilotClient) do(ctx context.Context, operation, path string, body
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	apiErr := &m365APIError{StatusCode: resp.StatusCode, Status: resp.Status, Operation: operation}
+	apiErr := &m365APIError{StatusCode: resp.StatusCode, Status: resp.Status, Operation: operation, RequestID: resp.Header.Get("request-id")}
 	var graphErr struct {
 		Error m365GraphError `json:"error"`
 	}

@@ -451,6 +451,37 @@ func TestM365ForbiddenErrorExplainsRequirements(t *testing.T) {
 	}
 }
 
+// Graph wraps a refusal from Copilot's backend in a 500, as seen on a tenant
+// whose user has no Microsoft 365 license. It must not be retried.
+func TestM365WrappedForbiddenIsNotRetried(t *testing.T) {
+	graph, server := newMockGraph(t)
+	graph.failures = []mockFailure{{status: http.StatusInternalServerError,
+		body: `{"error":{"code":"internalServerError","message":"Got Non-2xx response from IC3. Status = 403 (Forbidden)"}}`}}
+	client := newTestM365Client(server, &fakeTokens{})
+
+	start := time.Now()
+	var err error
+	for event := range client.stream(sessionContext("s"), []message.Message{userMessage("u1", "Hi")}, nil) {
+		if event.Type == EventError {
+			err = event.Error
+		}
+	}
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("a wrapped 403 shouldn't be retried, took %s", elapsed)
+	}
+	for _, want := range []string{"IC3. Status = 403", "Microsoft 365 Copilot license", "Exchange Online and Teams"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should mention %q", err, want)
+		}
+	}
+	if _, requests := graph.snapshot(); len(requests) != 1 {
+		t.Errorf("expected exactly one attempt, got %d", len(requests))
+	}
+}
+
 func TestM365ExpiredConversationIsReplayed(t *testing.T) {
 	graph, server := newMockGraph(t, "One.", "Two.")
 	client := newTestM365Client(server, &fakeTokens{})
